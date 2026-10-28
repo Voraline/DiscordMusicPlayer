@@ -62,12 +62,13 @@ jobs:
           path: |
             ${{ env.VCPKG_ROOT }}/downloads
             ${{ github.workspace }}/vcpkg-cache
-          key: vcpkg-${{ runner.os }}-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json', 'third_party/vcpkg-overlays/mlspp/**') }}
+          key: "vcpkg-${{ runner.os }}-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json', 'third_party/vcpkg-overlays/mlspp/**') }}"
           restore-keys: |
             vcpkg-${{ runner.os }}-
 
       - name: Bootstrap vcpkg
-        run: "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+        run: |
+          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
 
       - name: Set manifest baseline
         env:
