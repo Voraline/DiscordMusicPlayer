@@ -290,31 +290,15 @@ std::optional<SocketConfig> VoiceUdpSocket::PerformIPDiscovery(
 	WriteBig16(Packet + 2, 70);
 	WriteBig32(Packet + 4, Ssrc);
 
-	constexpr auto ResendInterval = std::chrono::milliseconds(500);
-	const auto Deadline = std::chrono::steady_clock::now() + Timeout;
-
-	std::unique_lock Lock(Mutex_);
-	while (!Stop_.load() && !DiscoveryResult_) {
-		const auto Now = std::chrono::steady_clock::now();
-		if (Now >= Deadline) {
-			break;
-		}
-
-		Lock.unlock();
-		const bool Sent = Send(std::span<const std::uint8_t>(Packet, sizeof(Packet)));
-		Lock.lock();
-		if (!Sent) {
-			break;
-		}
-
-		DiscoveryCv_.wait_until(
-			Lock,
-			std::min(Now + ResendInterval, Deadline),
-			[this] { return DiscoveryResult_.has_value() || Stop_.load(); }
-		);
+	if (!Send(std::span<const std::uint8_t>(Packet, sizeof(Packet)))) {
+		return std::nullopt;
 	}
 
-	if (!DiscoveryResult_) {
+	std::unique_lock Lock(Mutex_);
+	const bool Ready = DiscoveryCv_.wait_for(Lock, Timeout, [this] {
+		return DiscoveryResult_.has_value() || Stop_.load();
+	});
+	if (!Ready) {
 		return std::nullopt;
 	}
 	return DiscoveryResult_;

@@ -259,7 +259,6 @@ void Networking::HandlePacket(const Json& Packet) {
 			if (!Local) {
 				if (Code_.load() != NetworkingStatusCode::Closed) {
 					Fail("Voice IP discovery failed");
-					HandleClose(0);
 				}
 				return;
 			}
