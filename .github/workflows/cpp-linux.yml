@@ -51,10 +51,10 @@ jobs:
             libtool pkg-config perl curl zip unzip tar
 
       - name: Install vcpkg
+        id: vcpkg
         run: |
           git clone https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
-          git -C "$VCPKG_ROOT" checkout 98d7cb0cf1f4686a3e43aa5672b6230c1d56bce8
-          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          echo "baseline=$(git -C "$VCPKG_ROOT" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Cache vcpkg
         uses: actions/cache@v4
@@ -62,9 +62,27 @@ jobs:
           path: |
             ${{ env.VCPKG_ROOT }}/downloads
             ${{ github.workspace }}/vcpkg-cache
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'third_party/vcpkg-overlays/mlspp/**') }}
+          key: vcpkg-${{ runner.os }}-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json', 'third_party/vcpkg-overlays/mlspp/**') }}
           restore-keys: |
             vcpkg-${{ runner.os }}-
+
+      - name: Bootstrap vcpkg
+        run: "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+
+      - name: Set manifest baseline
+        env:
+          BASELINE: ${{ steps.vcpkg.outputs.baseline }}
+        run: |
+          python3 - <<'EOF'
+          import json
+          import os
+
+          with open("vcpkg.json") as handle:
+              manifest = json.load(handle)
+          manifest["builtin-baseline"] = os.environ["BASELINE"]
+          with open("vcpkg.json", "w") as handle:
+              json.dump(manifest, handle, indent=2)
+          EOF
 
       - name: Configure
         run: |
