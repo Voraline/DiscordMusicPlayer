@@ -2,3 +2,6 @@ build/
 build-*/
 out/
 .vs/
+config.json
+__pycache__/
+*.pyc

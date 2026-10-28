@@ -162,6 +162,13 @@ bool VoiceUdpSocket::Open() {
 	setsockopt(S, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&BufferSize), sizeof(BufferSize));
 	setsockopt(S, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&BufferSize), sizeof(BufferSize));
 
+#if !defined(_WIN32)
+	int SocketPriority = 6;
+	setsockopt(S, SOL_SOCKET, SO_PRIORITY, &SocketPriority, sizeof(SocketPriority));
+	int Tos = 0xB8;
+	setsockopt(S, IPPROTO_IP, IP_TOS, &Tos, sizeof(Tos));
+#endif
+
 #if defined(_WIN32)
 	DWORD Timeout = 250;
 #else

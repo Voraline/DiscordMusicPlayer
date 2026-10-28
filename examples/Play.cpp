@@ -53,9 +53,7 @@ int main(int Argc, char** Argv) {
 		if (!Client.Start()) {
 			std::cerr << "Ready " << Client.ReadyCount() << "/" << Client.BotCount()
 					  << " - " << Client.LastError() << "\n";
-			if (Client.ReadyCount() == 0) {
-				return 1;
-			}
+			return 1;
 		}
 
 		Client.PlayFile(Argv[Argument + 2]);
