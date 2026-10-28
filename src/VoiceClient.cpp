@@ -7,11 +7,7 @@
 #else
 #include <pthread.h>
 #include <sched.h>
-#include <sys/mman.h>
-#include <sys/prctl.h>
 #endif
-
-#include <cstdlib>
 
 #include <algorithm>
 #include <array>
@@ -40,6 +36,15 @@ namespace {
 
 constexpr std::uint32_t TimestampIncrement = 960;
 constexpr int FrameMilliseconds = 20;
+constexpr int MaxRejoinAttempts = 6;
+constexpr auto HandshakeTimeout = std::chrono::milliseconds(6000);
+
+std::int64_t SteadyNowMs() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+			   std::chrono::steady_clock::now().time_since_epoch()
+	)
+		.count();
+}
 
 std::uint16_t Random16() {
 	std::uint8_t Bytes[2]{};
@@ -79,18 +84,21 @@ struct VoiceClient::Impl {
 	struct Bot {
 		BotOptions Options;
 		std::unique_ptr<GatewayClient> Gateway;
-		std::unique_ptr<VoiceConnection> Connection;
-		std::unique_ptr<AudioPlayer> Player;
+		std::shared_ptr<VoiceConnection> Connection;
+		std::shared_ptr<AudioPlayer> Player;
 		std::shared_ptr<AudioResource> Resource;
 		std::atomic<bool> Ready{false};
 		std::atomic<bool> Failed{false};
+		std::atomic<std::uint64_t> Generation{0};
+		std::atomic<std::int64_t> ConnectStarted{0};
 		std::atomic<int> RejoinAttempts{0};
-		std::jthread Rejoin;
-		std::jthread Watchdog;
 	};
 
-	static constexpr int MaxRejoinAttempts = 5;
-	static constexpr int HandshakeTimeoutSteps = 60;
+	struct Playback {
+		Bot* Entry;
+		std::shared_ptr<VoiceConnection> Connection;
+		std::shared_ptr<AudioPlayer> Player;
+	};
 
 	VoiceClient* Owner;
 	JoinConfig Config;
@@ -108,6 +116,7 @@ struct VoiceClient::Impl {
 
 	std::thread Scheduler;
 	std::jthread Connector;
+	std::jthread Supervisor;
 
 	Impl(
 		VoiceClient* OwnerPointer,
@@ -146,11 +155,24 @@ struct VoiceClient::Impl {
 				Debug("[" + Raw->Options.Name + "] " + Message);
 			};
 			Raw->Gateway->OnClose = [this, Raw](int Code) {
-				if (Code != 0 && Code != 1000) {
-					Report(Raw->Options.Name, "Gateway closed with code " + std::to_string(Code));
+				if (Stopping.load()) {
+					return;
 				}
+				if (Raw->Failed.exchange(true)) {
+					return;
+				}
+				Report(
+					Raw->Options.Name,
+					Code != 0 && Code != 1000
+						? "Gateway closed with code " + std::to_string(Code)
+						: "Gateway connection closed"
+				);
+				const bool WasReady = Raw->Ready.exchange(false);
 				{
 					std::lock_guard Lock(Mutex);
+					if (WasReady && ReadyCount > 0) {
+						--ReadyCount;
+					}
 					++FailedCount;
 				}
 				Condition.notify_all();
@@ -162,7 +184,6 @@ struct VoiceClient::Impl {
 
 	~Impl() {
 		Disconnect();
-		Stopping = true;
 		Bots.clear();
 #if defined(_WIN32)
 		timeEndPeriod(1);
@@ -189,19 +210,10 @@ struct VoiceClient::Impl {
 	}
 
 	void CreateConnection(Bot* Target, const VoiceServerInfo& Server, const VoiceStateInfo& State) {
-		auto StopThread = [](std::jthread& Thread) {
-			if (!Thread.joinable()) {
-				return;
-			}
-			Thread.request_stop();
-			if (Thread.get_id() == std::this_thread::get_id()) {
-				Thread.detach();
-				return;
-			}
-			Thread.join();
-		};
-		StopThread(Target->Watchdog);
-		StopThread(Target->Rejoin);
+		if (Playing.load() || Target->Ready.load()) {
+			Debug("[" + Target->Options.Name + "] ignoring redundant voice session update");
+			return;
+		}
 
 		ConnectionOptions Options;
 		Options.ServerId = Config.GuildId;
@@ -211,17 +223,26 @@ struct VoiceClient::Impl {
 		Options.Token = Server.Token;
 		Options.Endpoint = Server.Endpoint;
 
-		if (Target->Player) {
-			Target->Player->ClearSubscribers();
-			Target->Player.reset();
+		const std::uint64_t Generation = Target->Generation.fetch_add(1) + 1;
+
+		std::shared_ptr<AudioPlayer> PreviousPlayer = std::move(Target->Player);
+		std::shared_ptr<VoiceConnection> PreviousConnection = std::move(Target->Connection);
+		if (PreviousPlayer) {
+			PreviousPlayer->ClearSubscribers();
 		}
-		if (Target->Connection) {
-			Target->Connection->Destroy();
-			Target->Connection.reset();
+		if (PreviousConnection) {
+			PreviousConnection->Destroy();
 		}
 
-		Target->Ready = false;
-		Target->Failed = false;
+		const bool WasReady = Target->Ready.exchange(false);
+		Target->ConnectStarted = SteadyNowMs();
+		if (WasReady) {
+			std::lock_guard Lock(Mutex);
+			if (ReadyCount > 0) {
+				--ReadyCount;
+			}
+		}
+
 		Target->Player = std::make_unique<AudioPlayer>();
 		Target->Player->SetNoSubscriberBehavior(NoSubscriberBehavior::Pause);
 		Target->Player->OnDebug = [this, Target](const std::string& Message) {
@@ -230,90 +251,31 @@ struct VoiceClient::Impl {
 
 		Target->Connection = std::make_unique<VoiceConnection>(Config, Options, Settings.Debug);
 		Target->Connection->Subscribe(Target->Player.get());
-		Target->Connection->OnReady = [this, Target] { HandleConnectionReady(Target); };
-		Target->Connection->OnClose = [this, Target](int Code) { HandleConnectionClosed(Target, Code); };
-		Target->Connection->OnError = [this, Target](const std::string& Message) {
+		Target->Connection->OnReady = [this, Target, Generation] {
+			if (Target->Generation.load() != Generation) {
+				return;
+			}
+			HandleConnectionReady(Target);
+		};
+		Target->Connection->OnClose = [this, Target, Generation](int Code) {
+			if (Target->Generation.load() != Generation) {
+				return;
+			}
+			HandleConnectionClosed(Target, Code);
+		};
+		Target->Connection->OnError = [this, Target, Generation](const std::string& Message) {
+			if (Target->Generation.load() != Generation) {
+				return;
+			}
 			Report(Target->Options.Name, Message);
 		};
 		Target->Connection->OnDebug = [this, Target](const std::string& Message) {
 			Debug("[" + Target->Options.Name + "] " + Message);
 		};
 		Target->Connection->Start();
-		Target->Watchdog = std::jthread([this, Target](std::stop_token Token) {
-			for (int Step = 0; Step < HandshakeTimeoutSteps && !Token.stop_requested(); ++Step) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(100));
-			}
-			if (Token.stop_requested() || Stopping.load() || Playing.load()) {
-				return;
-			}
-			if (Target->Ready.load()) {
-				return;
-			}
-			Debug("[" + Target->Options.Name + "] voice handshake timeout");
-			if (Target->Connection) {
-				Target->Connection->Destroy();
-			}
-			ScheduleRejoin(Target);
-		});
-	}
-
-	void ScheduleRejoin(Bot* Target) {
-		if (Stopping.load() || Playing.load()) {
-			return;
-		}
-
-		if (Target->Watchdog.joinable()) {
-			Target->Watchdog.request_stop();
-		}
-		if (Target->Rejoin.joinable()) {
-			Target->Rejoin.request_stop();
-			if (Target->Rejoin.get_id() == std::this_thread::get_id()) {
-				Target->Rejoin.detach();
-			} else {
-				Target->Rejoin.join();
-			}
-		}
-
-		const int Attempt = Target->RejoinAttempts.fetch_add(1);
-		if (Attempt >= MaxRejoinAttempts) {
-			bool Expected = false;
-			if (Target->Failed.compare_exchange_strong(Expected, true)) {
-				{
-					std::lock_guard Lock(Mutex);
-					++FailedCount;
-				}
-				Report(Target->Options.Name, "Voice connection failed after retries");
-				Condition.notify_all();
-			}
-			return;
-		}
-
-		const int DelayMs = 1000 + Attempt * 1000;
-		Debug("[" + Target->Options.Name + "] retrying voice connection " + std::to_string(Attempt + 1));
-		Target->Rejoin = std::jthread([this, Target, DelayMs](std::stop_token Token) {
-			const int Steps = DelayMs / 100;
-			for (int Step = 0; Step < Steps && !Token.stop_requested(); ++Step) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(100));
-			}
-			if (Token.stop_requested() || Stopping.load() || Playing.load()) {
-				return;
-			}
-			if (Target->Gateway) {
-				Target->Gateway->Join(Config);
-			}
-		});
 	}
 
 	void HandleConnectionReady(Bot* Target) {
-		Target->RejoinAttempts = 0;
-		Target->Failed = false;
-		if (Target->Watchdog.joinable()) {
-			Target->Watchdog.request_stop();
-		}
-		if (Target->Rejoin.joinable()) {
-			Target->Rejoin.request_stop();
-		}
-
 		bool Increment = false;
 		{
 			std::lock_guard Lock(Mutex);
@@ -322,6 +284,9 @@ struct VoiceClient::Impl {
 				Increment = true;
 			}
 		}
+		Target->RejoinAttempts = 0;
+		Target->ConnectStarted = 0;
+		Target->Failed = false;
 		if (Increment) {
 			Debug("[" + Target->Options.Name + "] voice ready");
 		}
@@ -330,35 +295,89 @@ struct VoiceClient::Impl {
 
 	void HandleConnectionClosed(Bot* Target, int Code) {
 		const bool WasReady = Target->Ready.exchange(false);
-		{
+		if (WasReady) {
 			std::lock_guard Lock(Mutex);
-			if (WasReady && ReadyCount > 0) {
+			if (ReadyCount > 0) {
 				--ReadyCount;
 			}
 		}
-
-		if (Target->Watchdog.joinable()) {
-			Target->Watchdog.request_stop();
-		}
-
-		const bool CanRetry = !Playing.load() && !Stopping.load();
-		if (CanRetry) {
-			Debug(
-				"[" + Target->Options.Name + "] voice closed during startup with code "
-				+ std::to_string(Code)
-			);
-			ScheduleRejoin(Target);
-		} else if (Code == 4006) {
+		Target->ConnectStarted = SteadyNowMs();
+		if (WasReady && Code == 4006) {
 			Report(
 				Target->Options.Name,
 				"Voice session invalidated (4006); another client/session likely took over this account"
 			);
-		} else if (Code != 0 && Code != 1000) {
+		} else if (WasReady && Code != 0 && Code != 1000) {
 			Report(Target->Options.Name, "Voice connection closed with code " + std::to_string(Code));
 		} else {
-			Debug("[" + Target->Options.Name + "] voice connection closed");
+			Debug(
+				"[" + Target->Options.Name + "] voice connection closed (code "
+				+ std::to_string(Code) + "), retrying"
+			);
 		}
 		Condition.notify_all();
+	}
+
+	void RunSupervisor(std::stop_token Token) {
+		while (!Token.stop_requested()) {
+			for (int Step = 0; Step < 5 && !Token.stop_requested(); ++Step) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			}
+			if (Token.stop_requested()) {
+				break;
+			}
+			if (Stopping.load() || Playing.load()) {
+				continue;
+			}
+
+			const std::int64_t Now = SteadyNowMs();
+			for (std::unique_ptr<Bot>& Entry : Bots) {
+				Bot* Target = Entry.get();
+				if (Target->Failed.load()) {
+					continue;
+				}
+				if (Target->Ready.load()) {
+					Target->RejoinAttempts = 0;
+					Target->ConnectStarted = 0;
+					continue;
+				}
+				if (!Target->Gateway->IsReady()) {
+					continue;
+				}
+
+				const std::int64_t Started = Target->ConnectStarted.load();
+				if (Started == 0) {
+					Target->ConnectStarted = Now;
+					continue;
+				}
+				if (Now - Started < HandshakeTimeout.count()) {
+					continue;
+				}
+
+				const int Attempt = Target->RejoinAttempts.fetch_add(1) + 1;
+				if (Attempt > MaxRejoinAttempts) {
+					Target->Failed = true;
+					Report(
+						Target->Options.Name,
+						"Voice handshake did not complete after "
+							+ std::to_string(MaxRejoinAttempts) + " rejoin attempts"
+					);
+					{
+						std::lock_guard Lock(Mutex);
+						++FailedCount;
+					}
+					Condition.notify_all();
+					continue;
+				}
+
+				Debug(
+					"[" + Target->Options.Name + "] voice handshake timeout, rejoining ("
+					+ std::to_string(Attempt) + "/" + std::to_string(MaxRejoinAttempts) + ")"
+				);
+				Target->ConnectStarted = Now;
+				Target->Gateway->Join(Config);
+			}
+		}
 	}
 
 	bool Start() {
@@ -367,10 +386,30 @@ struct VoiceClient::Impl {
 			return false;
 		}
 
+		Supervisor.request_stop();
+		if (Supervisor.joinable()) {
+			Supervisor.join();
+		}
 		Connector.request_stop();
 		if (Connector.joinable()) {
 			Connector.join();
 		}
+
+		{
+			std::lock_guard Lock(Mutex);
+			ReadyCount = 0;
+			FailedCount = 0;
+			Error.clear();
+		}
+		for (std::unique_ptr<Bot>& Entry : Bots) {
+			Entry->Generation.fetch_add(1);
+			Entry->Ready = false;
+			Entry->Failed = false;
+			Entry->ConnectStarted = 0;
+			Entry->RejoinAttempts = 0;
+		}
+
+		Supervisor = std::jthread([this](std::stop_token Token) { RunSupervisor(Token); });
 
 		Connector = std::jthread([this](std::stop_token Token) {
 			for (std::size_t Index = 0; Index < Bots.size(); ++Index) {
@@ -434,13 +473,13 @@ struct VoiceClient::Impl {
 
 		Stop();
 
-		std::vector<Bot*> Active;
+		std::vector<Playback> Active;
 		{
 			std::lock_guard Lock(Mutex);
 			for (std::unique_ptr<Bot>& Entry : Bots) {
 				if (Entry->Connection && Entry->Player
 					&& Entry->Connection->Status() == VoiceConnectionStatus::Ready) {
-					Active.push_back(Entry.get());
+					Active.push_back(Playback{Entry.get(), Entry->Connection, Entry->Player});
 				}
 			}
 			if (Active.empty()) {
@@ -448,36 +487,37 @@ struct VoiceClient::Impl {
 			}
 			Finished = false;
 			Stopping = false;
+			Playing = true;
 		}
 
 		const auto DaveDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-		for (Bot* Target : Active) {
+		for (const Playback& Target : Active) {
 			bool Warned = false;
-			while (!Target->Connection->DaveReady()) {
+			while (!Target.Connection->DaveReady()) {
 				if (!Warned) {
-					Debug("[" + Target->Options.Name + "] waiting for DAVE");
+					Debug("[" + Target.Entry->Options.Name + "] waiting for DAVE");
 					Warned = true;
 				}
 				if (Stopping.load() || std::chrono::steady_clock::now() >= DaveDeadline) {
+					Playing = false;
 					throw std::runtime_error(
-						"DAVE encryption is not ready for " + Target->Options.Name
+						"DAVE encryption is not ready for " + Target.Entry->Options.Name
 					);
 				}
 				std::this_thread::sleep_for(std::chrono::milliseconds(10));
 			}
 		}
 
-		Playing = true;
-		for (Bot* Target : Active) {
-			Target->Resource = std::make_shared<AudioResource>(Audio, Settings.SilencePaddingFrames);
-			Target->Player->Play(Target->Resource);
-			Target->Connection->SetSpeaking(true);
+		for (const Playback& Target : Active) {
+			Target.Entry->Resource = std::make_shared<AudioResource>(Audio, Settings.SilencePaddingFrames);
+			Target.Player->Play(Target.Entry->Resource);
+			Target.Connection->SetSpeaking(true);
 		}
 
 		Scheduler = std::thread([this, Audio, Active] { RunScheduler(Audio, Active); });
 	}
 
-	void RunScheduler(const std::shared_ptr<EncodedAudio>& Audio, const std::vector<Bot*>& Active) {
+	void RunScheduler(const std::shared_ptr<EncodedAudio>& Audio, const std::vector<Playback>& Active) {
 		bool MmcssOk = false;
 		bool PriorityOk = false;
 #if defined(_WIN32)
@@ -486,54 +526,24 @@ struct VoiceClient::Impl {
 		MmcssOk = Mmcss != nullptr;
 		PriorityOk = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) != 0;
 #else
-		const bool Locked = mlockall(MCL_CURRENT | MCL_FUTURE) == 0;
-		prctl(PR_SET_TIMERSLACK, 1, 0, 0, 0);
-
-		bool AffinityOk = false;
-		int AffinityCpu = -1;
-		const char* CpuValue = std::getenv("VOICE_CPU");
-		if (CpuValue) {
-			const int Cpu = std::atoi(CpuValue);
-			if (Cpu >= 0) {
-				cpu_set_t Set;
-				CPU_ZERO(&Set);
-				CPU_SET(Cpu, &Set);
-				AffinityOk = sched_setaffinity(0, sizeof(Set), &Set) == 0;
-				AffinityCpu = Cpu;
-			}
-		}
-
 		sched_param PriorityParam{};
-		const int MaxPriority = sched_get_priority_max(SCHED_FIFO);
-		PriorityParam.sched_priority = MaxPriority > 0 ? MaxPriority - 1 : 1;
+		PriorityParam.sched_priority = 80;
 		PriorityOk = pthread_setschedparam(pthread_self(), SCHED_FIFO, &PriorityParam) == 0;
-		if (!PriorityOk) {
-			sched_param CurrentParam{};
-			int CurrentPolicy = 0;
-			if (pthread_getschedparam(pthread_self(), &CurrentPolicy, &CurrentParam) == 0
-				&& CurrentPolicy == SCHED_FIFO) {
-				PriorityOk = true;
-			}
-		}
 #endif
 
 		if (Settings.Debug) {
-			std::string Info = "[SYNC] mmcss=" + std::string(MmcssOk ? "1" : "0")
-				+ " timeCritical=" + std::string(PriorityOk ? "1" : "0");
-#if !defined(_WIN32)
-			Info += " mlock=" + std::string(Locked ? "1" : "0")
-				+ " affinity=" + std::string(AffinityOk ? "1" : "0")
-				+ " cpu=" + std::to_string(AffinityCpu);
-#endif
-			Debug(Info);
+			Debug(
+				"[SYNC] mmcss=" + std::string(MmcssOk ? "1" : "0")
+				+ " timeCritical=" + std::string(PriorityOk ? "1" : "0")
+			);
 		}
 
 		const auto StartTime = std::chrono::steady_clock::now() + Settings.LeadTime;
 		const std::uint16_t BaseSequence = Random16();
 		const std::uint32_t BaseTimestamp = Random32();
 
-		for (Bot* Target : Active) {
-			Target->Player->StepPrepare(BaseSequence, BaseTimestamp);
+		for (const Playback& Target : Active) {
+			Target.Player->StepPrepare(BaseSequence, BaseTimestamp);
 		}
 
 		const bool MeasureSync = Settings.Debug;
@@ -562,8 +572,8 @@ struct VoiceClient::Impl {
 
 		for (std::size_t Frame = 0; Frame < MaximumFrames; ++Frame) {
 			bool AnyActive = false;
-			for (Bot* Target : Active) {
-				if (Target->Player->Status() != AudioPlayerStatus::Idle) {
+			for (const Playback& Target : Active) {
+				if (Target.Player->Status() != AudioPlayerStatus::Idle) {
 					AnyActive = true;
 					break;
 				}
@@ -585,7 +595,7 @@ struct VoiceClient::Impl {
 				auto Last = First;
 				for (std::size_t Index = 0; Index < Active.size(); ++Index) {
 					Last = std::chrono::steady_clock::now();
-					Active[Index]->Connection->DispatchAudio();
+					Active[Index].Connection->DispatchAudio();
 				}
 				const long long SkewNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
 					Last - First
@@ -599,8 +609,8 @@ struct VoiceClient::Impl {
 					ReportSync();
 				}
 			} else {
-				for (Bot* Target : Active) {
-					Target->Connection->DispatchAudio();
+				for (const Playback& Target : Active) {
+					Target.Connection->DispatchAudio();
 				}
 			}
 
@@ -608,17 +618,17 @@ struct VoiceClient::Impl {
 			const std::uint32_t Timestamp = BaseTimestamp
 				+ static_cast<std::uint32_t>((Frame + 1) * TimestampIncrement);
 
-			for (Bot* Target : Active) {
-				Target->Player->StepPrepare(Sequence, Timestamp);
+			for (const Playback& Target : Active) {
+				Target.Player->StepPrepare(Sequence, Timestamp);
 			}
 		}
 
 		ReportSync();
 
 		Playing = false;
-		for (Bot* Target : Active) {
-			Target->Connection->SetSpeaking(false);
-			Target->Player->Stop(true);
+		for (const Playback& Target : Active) {
+			Target.Connection->SetSpeaking(false);
+			Target.Player->Stop(true);
 		}
 
 #if defined(_WIN32)
@@ -665,6 +675,12 @@ struct VoiceClient::Impl {
 	}
 
 	void Disconnect() {
+		Stopping = true;
+		Supervisor.request_stop();
+		if (Supervisor.joinable() && Supervisor.get_id() != std::this_thread::get_id()) {
+			Supervisor.join();
+		}
+
 		Stop();
 
 		Connector.request_stop();
@@ -673,6 +689,7 @@ struct VoiceClient::Impl {
 		}
 
 		for (std::unique_ptr<Bot>& Entry : Bots) {
+			Entry->Generation.fetch_add(1);
 			if (Entry->Connection) {
 				Entry->Connection->Destroy();
 				Entry->Connection.reset();
@@ -693,8 +710,8 @@ struct VoiceClient::Impl {
 			ReadyCount = 0;
 			FailedCount = 0;
 		}
-		Stopping = true;
 		Condition.notify_all();
+		Stopping = false;
 	}
 };
 

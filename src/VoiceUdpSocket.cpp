@@ -162,13 +162,6 @@ bool VoiceUdpSocket::Open() {
 	setsockopt(S, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&BufferSize), sizeof(BufferSize));
 	setsockopt(S, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&BufferSize), sizeof(BufferSize));
 
-#if !defined(_WIN32)
-	int SocketPriority = 6;
-	setsockopt(S, SOL_SOCKET, SO_PRIORITY, &SocketPriority, sizeof(SocketPriority));
-	int Tos = 0xB8;
-	setsockopt(S, IPPROTO_IP, IP_TOS, &Tos, sizeof(Tos));
-#endif
-
 #if defined(_WIN32)
 	DWORD Timeout = 250;
 #else
@@ -297,15 +290,31 @@ std::optional<SocketConfig> VoiceUdpSocket::PerformIPDiscovery(
 	WriteBig16(Packet + 2, 70);
 	WriteBig32(Packet + 4, Ssrc);
 
-	if (!Send(std::span<const std::uint8_t>(Packet, sizeof(Packet)))) {
-		return std::nullopt;
-	}
+	constexpr auto ResendInterval = std::chrono::milliseconds(500);
+	const auto Deadline = std::chrono::steady_clock::now() + Timeout;
 
 	std::unique_lock Lock(Mutex_);
-	const bool Ready = DiscoveryCv_.wait_for(Lock, Timeout, [this] {
-		return DiscoveryResult_.has_value() || Stop_.load();
-	});
-	if (!Ready) {
+	while (!Stop_.load() && !DiscoveryResult_) {
+		const auto Now = std::chrono::steady_clock::now();
+		if (Now >= Deadline) {
+			break;
+		}
+
+		Lock.unlock();
+		const bool Sent = Send(std::span<const std::uint8_t>(Packet, sizeof(Packet)));
+		Lock.lock();
+		if (!Sent) {
+			break;
+		}
+
+		DiscoveryCv_.wait_until(
+			Lock,
+			std::min(Now + ResendInterval, Deadline),
+			[this] { return DiscoveryResult_.has_value() || Stop_.load(); }
+		);
+	}
+
+	if (!DiscoveryResult_) {
 		return std::nullopt;
 	}
 	return DiscoveryResult_;
