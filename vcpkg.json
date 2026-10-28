@@ -1,0 +1,20 @@
+{
+  "name": "voice",
+  "version-string": "1.0.0",
+  "builtin-baseline": "98d7cb0cf1f4686a3e43aa5672b6230c1d56bce8",
+  "dependencies": [
+    "openssl",
+    "nlohmann-json",
+    {
+      "name": "mlspp",
+      "features": [
+        "openssl"
+      ]
+    }
+  ],
+  "vcpkg-configuration": {
+    "overlay-ports": [
+      "third_party/vcpkg-overlays"
+    ]
+  }
+}
