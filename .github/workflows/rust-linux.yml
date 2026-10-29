@@ -1,0 +1,61 @@
+name: Rust Linux Release
+
+on:
+  push:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/rust-linux.yml'
+  pull_request:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/rust-linux.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C target-cpu=native"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Test
+        working-directory: rust
+        run: cargo test --release
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp rust/target/release/VoicePlay dist/
+          strip --strip-all dist/VoicePlay
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoicePlay-rust-linux-x86_64
+          path: dist/
+          if-no-files-found: error
