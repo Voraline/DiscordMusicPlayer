@@ -12,24 +12,24 @@ name = "VoicePlay"
 path = "src/main.rs"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-chacha20poly1305 = "0.10"
-getrandom = "0.3"
-parking_lot = "0.12"
-socket2 = "0.6"
-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+chacha20poly1305 = "0.11.0"
+getrandom = "0.4.3"
+parking_lot = "0.13.0"
+socket2 = "0.6.5"
+tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 davey = "0.2.0-beta.1"
 audiopus = "0.3.0-rc.0"
 audiopus_sys = { version = "0.2.2", features = ["static"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
-nix = { version = "0.31", features = ["sched", "mman", "process"] }
+libc = "0.2.191"
+nix = { version = "0.31.3", features = ["sched", "mman", "process"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
+windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_Media",

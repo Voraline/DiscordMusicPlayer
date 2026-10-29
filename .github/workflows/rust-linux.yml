@@ -50,6 +50,9 @@ jobs:
       - name: Test
         run: cargo test --release
 
+      - name: Build
+        run: cargo build --release
+
       - name: Package
         run: |
           mkdir -p dist
