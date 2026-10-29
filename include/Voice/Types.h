@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -102,6 +103,8 @@ struct PlaybackOptions {
 	std::chrono::milliseconds ConnectTimeout{60000};
 	std::chrono::milliseconds ConnectStagger{750};
 	int SilencePaddingFrames = 5;
+	int WarmupFrames = 5;
+	std::size_t ParallelThreshold = 4;
 	std::uint32_t Bitrate = 128000;
 	int OpusComplexity = 10;
 	std::string FfmpegPath = "ffmpeg";

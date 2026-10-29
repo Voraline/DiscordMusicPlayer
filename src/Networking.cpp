@@ -672,21 +672,20 @@ void Networking::BuildPacket(
 }
 
 bool Networking::DispatchAudio() {
-	if (Code_.load(std::memory_order_acquire) != NetworkingStatusCode::Ready) {
-		return false;
-	}
-	if (PreparedPacket_.empty()) {
+	if (Code_.load(std::memory_order_acquire) != NetworkingStatusCode::Ready
+		|| PreparedPacket_.empty()) [[unlikely]] {
 		return false;
 	}
 
-	const std::size_t PacketSize = PreparedPacket_.size();
 	const bool Sent = Udp_ && Udp_->Send(PreparedPacket_);
-	if (Debug_ && OnDebug && !AudioSendLogged_) {
+	if (Debug_ && !AudioSendLogged_) [[unlikely]] {
 		AudioSendLogged_ = true;
-		OnDebug(
-			"[UDP] audio send " + std::to_string(PacketSize) + " bytes ok="
-			+ std::to_string(Sent ? 1 : 0)
-		);
+		if (OnDebug) {
+			OnDebug(
+				"[UDP] audio send " + std::to_string(PreparedPacket_.size()) + " bytes ok="
+				+ std::to_string(Sent ? 1 : 0)
+			);
+		}
 	}
 	PreparedPacket_.clear();
 	return Sent;

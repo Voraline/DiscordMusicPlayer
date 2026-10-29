@@ -1,20 +1,13 @@
 #include "Voice/VoiceClient.h"
 
-#if defined(_WIN32)
-#include <windows.h>
-#include <avrt.h>
-#include <timeapi.h>
-#else
-#include <pthread.h>
-#include <sched.h>
-#endif
-
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -22,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "LinuxRealtime.h"
 #include "Platform.h"
 #include "Voice/AudioPlayer.h"
 #include "Voice/AudioResource.h"
@@ -36,6 +30,10 @@ namespace {
 
 constexpr std::uint32_t TimestampIncrement = 960;
 constexpr int FrameMilliseconds = 20;
+constexpr std::size_t SyncStartFrame = 20;
+constexpr std::size_t SyncSampleCount = 200;
+constexpr std::chrono::microseconds RealtimeSpinWindow{250};
+constexpr std::chrono::milliseconds FallbackSpinWindow{1};
 
 std::uint16_t Random16() {
 	std::uint8_t Bytes[2]{};
@@ -50,23 +48,6 @@ std::uint32_t Random32() {
 		| (static_cast<std::uint32_t>(Bytes[1]) << 16)
 		| (static_cast<std::uint32_t>(Bytes[2]) << 8)
 		| static_cast<std::uint32_t>(Bytes[3]);
-}
-
-void PrecisionWaitUntil(
-	std::chrono::steady_clock::time_point Deadline,
-	const std::atomic<bool>& Stopping
-) {
-	constexpr auto SpinWindow = std::chrono::milliseconds(1);
-	const auto Now = std::chrono::steady_clock::now();
-	if (Deadline > Now + SpinWindow) {
-		std::this_thread::sleep_until(Deadline - SpinWindow);
-	}
-	while (!Stopping.load(std::memory_order_relaxed)) {
-		if (std::chrono::steady_clock::now() >= Deadline) {
-			break;
-		}
-		Platform::CpuPause();
-	}
 }
 
 }
@@ -107,10 +88,6 @@ struct VoiceClient::Impl {
 		: Owner(OwnerPointer),
 		  Config(std::move(ConfigValue)),
 		  Settings(std::move(PlaybackSettings)) {
-#if defined(_WIN32)
-		timeBeginPeriod(1);
-#endif
-
 		for (BotOptions& Input : InputBots) {
 			auto BotPointer = std::make_unique<Bot>();
 			BotPointer->Options = std::move(Input);
@@ -152,9 +129,6 @@ struct VoiceClient::Impl {
 	~Impl() {
 		Disconnect();
 		Bots.clear();
-#if defined(_WIN32)
-		timeEndPeriod(1);
-#endif
 	}
 
 	void Report(const std::string& BotName, const std::string& Message) {
@@ -371,41 +345,57 @@ struct VoiceClient::Impl {
 	}
 
 	void RunScheduler(const std::shared_ptr<EncodedAudio>& Audio, const std::vector<Bot*>& Active) {
-		bool MmcssOk = false;
-		bool PriorityOk = false;
-#if defined(_WIN32)
-		DWORD MmcssTask = 0;
-		HANDLE Mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &MmcssTask);
-		MmcssOk = Mmcss != nullptr;
-		PriorityOk = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) != 0;
-#else
-		sched_param PriorityParam{};
-		PriorityParam.sched_priority = 80;
-		PriorityOk = pthread_setschedparam(pthread_self(), SCHED_FIFO, &PriorityParam) == 0;
-#endif
+		const std::vector<int> Cpus = Linux::AllowedCpus();
+		const bool Locked = Linux::LockMemory();
 
-		if (Settings.Debug) {
-			Debug(
-				"[SYNC] mmcss=" + std::string(MmcssOk ? "1" : "0")
-				+ " timeCritical=" + std::string(PriorityOk ? "1" : "0")
-			);
-		}
+		const std::size_t Count = Active.size();
+		const bool Parallel = Count > 1 && Count >= Settings.ParallelThreshold && Cpus.size() >= Count;
+		const bool MeasureSync = Settings.Debug && Count > 1;
 
+		const auto FrameDuration = std::chrono::milliseconds(FrameMilliseconds);
 		const auto StartTime = std::chrono::steady_clock::now() + Settings.LeadTime;
 		const std::uint16_t BaseSequence = Random16();
 		const std::uint32_t BaseTimestamp = Random32();
+		const std::size_t Warmup = static_cast<std::size_t>(std::max(0, Settings.WarmupFrames));
+		const std::size_t MaximumFrames = Warmup + Audio->Frames.size()
+			+ static_cast<std::size_t>(Settings.SilencePaddingFrames) + 100;
 
-		for (Bot* Target : Active) {
-			Target->Player->StepPrepare(BaseSequence, BaseTimestamp);
-		}
+		const auto DeadlineOf = [&](std::size_t Frame) {
+			return StartTime + FrameDuration * static_cast<std::int64_t>(Frame);
+		};
 
-		const bool MeasureSync = Settings.Debug;
-		std::array<long long, 200> SyncSamples{};
+		const auto PrepareFrame = [&](Bot* Target, std::size_t Frame) {
+			const std::uint16_t Sequence = static_cast<std::uint16_t>(BaseSequence + Frame);
+			const std::uint32_t Timestamp = BaseTimestamp
+				+ static_cast<std::uint32_t>(Frame * TimestampIncrement);
+			if (Frame < Warmup) {
+				Target->Connection->PrepareAudioPacketFast(
+					AudioResource::SilenceFrame(),
+					Sequence,
+					Timestamp
+				);
+			} else {
+				Target->Player->StepPrepare(Sequence, Timestamp);
+			}
+		};
+
+		const auto LateFrames = [&](std::size_t Frame, std::chrono::steady_clock::time_point Now) {
+			const auto Lag = Now - DeadlineOf(Frame);
+			if (Lag < FrameDuration) {
+				return std::size_t{0};
+			}
+			return std::min(
+				static_cast<std::size_t>(Lag / FrameDuration),
+				MaximumFrames - 1 - Frame
+			);
+		};
+
+		std::array<long long, SyncSampleCount> SyncSamples{};
 		std::size_t SyncCount = 0;
 		long long MaxSkewNs = 0;
 		bool SyncReported = false;
 
-		auto ReportSync = [&] {
+		const auto ReportSync = [&] {
 			if (!MeasureSync || SyncCount == 0 || SyncReported) {
 				return;
 			}
@@ -420,75 +410,162 @@ struct VoiceClient::Impl {
 			);
 		};
 
-		const std::size_t MaximumFrames = Audio->Frames.size()
-			+ static_cast<std::size_t>(Settings.SilencePaddingFrames) + 100;
+		if (Parallel) {
+			Debug(
+				"[SYNC] mode=parallel workers=" + std::to_string(Count)
+				+ " locked=" + std::string(Locked ? "1" : "0")
+			);
 
-		for (std::size_t Frame = 0; Frame < MaximumFrames; ++Frame) {
-			bool AnyActive = false;
+			std::vector<long long> Stamps(MeasureSync ? Count * SyncSampleCount : 0, 0);
+			std::vector<std::thread> Workers;
+			Workers.reserve(Count);
+
+			for (std::size_t Index = 0; Index < Count; ++Index) {
+				Workers.emplace_back([&, Index] {
+					Bot* Target = Active[Index];
+					Linux::PinCurrentThread(Cpus[Cpus.size() - 1 - Index]);
+					const std::chrono::nanoseconds Spin = Linux::ElevateCurrentThread()
+						? RealtimeSpinWindow
+						: FallbackSpinWindow;
+
+					std::size_t Frame = 0;
+					PrepareFrame(Target, Frame);
+					while (Frame < MaximumFrames) {
+						if (Target->Player->Status() == AudioPlayerStatus::Idle || Stopping.load()) {
+							break;
+						}
+
+						const auto Now = Linux::WaitUntil(DeadlineOf(Frame), Spin, Stopping);
+						if (Stopping.load()) {
+							break;
+						}
+
+						const std::size_t Skip = LateFrames(Frame, Now);
+						for (std::size_t Ahead = 1; Ahead <= Skip; ++Ahead) {
+							PrepareFrame(Target, Frame + Ahead);
+						}
+						Frame += Skip;
+
+						if (MeasureSync && Frame >= SyncStartFrame
+							&& Frame < SyncStartFrame + SyncSampleCount) [[unlikely]] {
+							Stamps[Index * SyncSampleCount + (Frame - SyncStartFrame)]
+								= std::chrono::duration_cast<std::chrono::nanoseconds>(
+									  std::chrono::steady_clock::now().time_since_epoch()
+								)
+									  .count();
+						}
+						Target->Connection->DispatchAudio();
+
+						++Frame;
+						PrepareFrame(Target, Frame);
+					}
+				});
+			}
+
+			for (std::thread& Worker : Workers) {
+				Worker.join();
+			}
+
+			if (MeasureSync) {
+				for (std::size_t Slot = 0; Slot < SyncSampleCount; ++Slot) {
+					long long Low = std::numeric_limits<long long>::max();
+					long long High = 0;
+					bool Complete = true;
+					for (std::size_t Index = 0; Index < Count; ++Index) {
+						const long long Value = Stamps[Index * SyncSampleCount + Slot];
+						if (Value == 0) {
+							Complete = false;
+							break;
+						}
+						Low = std::min(Low, Value);
+						High = std::max(High, Value);
+					}
+					if (Complete) {
+						SyncSamples[SyncCount++] = High - Low;
+						MaxSkewNs = std::max(MaxSkewNs, High - Low);
+					}
+				}
+			}
+			ReportSync();
+		} else {
+			const bool Pinned = !Cpus.empty() && Linux::PinCurrentThread(Cpus.back());
+			const bool Realtime = Linux::ElevateCurrentThread();
+			const std::chrono::nanoseconds Spin = Realtime ? RealtimeSpinWindow : FallbackSpinWindow;
+			Debug(
+				"[SYNC] mode=serial realtime=" + std::string(Realtime ? "1" : "0")
+				+ " pinned=" + std::string(Pinned ? "1" : "0")
+				+ " locked=" + std::string(Locked ? "1" : "0")
+			);
+
 			for (Bot* Target : Active) {
-				if (Target->Player->Status() != AudioPlayerStatus::Idle) {
-					AnyActive = true;
+				PrepareFrame(Target, 0);
+			}
+
+			std::size_t Frame = 0;
+			while (Frame < MaximumFrames) {
+				bool AnyActive = false;
+				for (Bot* Target : Active) {
+					if (Target->Player->Status() != AudioPlayerStatus::Idle) {
+						AnyActive = true;
+						break;
+					}
+				}
+				if (!AnyActive || Stopping.load()) {
 					break;
 				}
-			}
-			if (!AnyActive || Stopping.load()) {
-				break;
-			}
 
-			PrecisionWaitUntil(
-				StartTime + std::chrono::milliseconds(static_cast<std::int64_t>(Frame) * FrameMilliseconds),
-				Stopping
-			);
-			if (Stopping.load()) {
-				break;
-			}
-
-			if (MeasureSync && Frame >= 20 && Frame < 220 && Active.size() > 1) {
-				const auto First = std::chrono::steady_clock::now();
-				auto Last = First;
-				for (std::size_t Index = 0; Index < Active.size(); ++Index) {
-					Last = std::chrono::steady_clock::now();
-					Active[Index]->Connection->DispatchAudio();
+				const auto Now = Linux::WaitUntil(DeadlineOf(Frame), Spin, Stopping);
+				if (Stopping.load()) {
+					break;
 				}
-				const long long SkewNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-					Last - First
-				)
-					.count();
-				MaxSkewNs = std::max(MaxSkewNs, SkewNs);
-				if (SyncCount < SyncSamples.size()) {
+
+				const std::size_t Skip = LateFrames(Frame, Now);
+				if (Skip > 0) {
+					for (Bot* Target : Active) {
+						for (std::size_t Ahead = 1; Ahead <= Skip; ++Ahead) {
+							PrepareFrame(Target, Frame + Ahead);
+						}
+					}
+					Frame += Skip;
+				}
+
+				const std::size_t Offset = Frame % Count;
+				if (MeasureSync && Frame >= SyncStartFrame && SyncCount < SyncSampleCount) [[unlikely]] {
+					const auto First = std::chrono::steady_clock::now();
+					auto Last = First;
+					for (std::size_t Step = 0; Step < Count; ++Step) {
+						Last = std::chrono::steady_clock::now();
+						Active[(Offset + Step) % Count]->Connection->DispatchAudio();
+					}
+					const long long SkewNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+						Last - First
+					)
+						.count();
+					MaxSkewNs = std::max(MaxSkewNs, SkewNs);
 					SyncSamples[SyncCount++] = SkewNs;
+					if (SyncCount == SyncSamples.size()) {
+						ReportSync();
+					}
+				} else {
+					for (std::size_t Step = 0; Step < Count; ++Step) {
+						Active[(Offset + Step) % Count]->Connection->DispatchAudio();
+					}
 				}
-				if (SyncCount == SyncSamples.size()) {
-					ReportSync();
-				}
-			} else {
+
+				++Frame;
 				for (Bot* Target : Active) {
-					Target->Connection->DispatchAudio();
+					PrepareFrame(Target, Frame);
 				}
 			}
 
-			const std::uint16_t Sequence = static_cast<std::uint16_t>(BaseSequence + Frame + 1);
-			const std::uint32_t Timestamp = BaseTimestamp
-				+ static_cast<std::uint32_t>((Frame + 1) * TimestampIncrement);
-
-			for (Bot* Target : Active) {
-				Target->Player->StepPrepare(Sequence, Timestamp);
-			}
+			ReportSync();
 		}
-
-		ReportSync();
 
 		Playing = false;
 		for (Bot* Target : Active) {
 			Target->Connection->SetSpeaking(false);
 			Target->Player->Stop(true);
 		}
-
-#if defined(_WIN32)
-		if (Mmcss) {
-			AvRevertMmThreadCharacteristics(Mmcss);
-		}
-#endif
 
 		{
 			std::lock_guard Lock(Mutex);

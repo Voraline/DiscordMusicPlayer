@@ -26,6 +26,12 @@ constexpr std::size_t DiscoverySize = 74;
 constexpr std::size_t KeepAliveSize = 8;
 
 #if defined(_WIN32)
+constexpr int SendFlags = 0;
+#else
+constexpr int SendFlags = MSG_NOSIGNAL | MSG_DONTWAIT;
+#endif
+
+#if defined(_WIN32)
 using NativeSocket = SOCKET;
 constexpr NativeSocket InvalidNativeSocket = INVALID_SOCKET;
 #else
@@ -184,8 +190,8 @@ bool VoiceUdpSocket::Send(std::span<const std::uint8_t> Data) {
 		return false;
 	}
 
-	const int Result = send(S, reinterpret_cast<const char*>(Data.data()), static_cast<int>(Data.size()), 0);
-	if (Result < 0) {
+	const auto Result = send(S, reinterpret_cast<const char*>(Data.data()), Data.size(), SendFlags);
+	if (Result < 0) [[unlikely]] {
 		if (OnError) {
 			OnError("UDP send failed with error " + std::to_string(LastSocketError()));
 		}
