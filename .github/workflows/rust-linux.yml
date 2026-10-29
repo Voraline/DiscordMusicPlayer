@@ -3,11 +3,17 @@ name: Rust Linux Release
 on:
   push:
     paths:
-      - 'rust/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
       - '.github/workflows/rust-linux.yml'
   pull_request:
     paths:
-      - 'rust/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
       - '.github/workflows/rust-linux.yml'
   workflow_dispatch:
 
@@ -40,17 +46,14 @@ jobs:
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
 
       - name: Test
-        working-directory: rust
         run: cargo test --release
 
       - name: Package
         run: |
           mkdir -p dist
-          cp rust/target/release/VoicePlay dist/
+          cp target/release/VoicePlay dist/
           strip --strip-all dist/VoicePlay
 
       - name: Upload artifact
