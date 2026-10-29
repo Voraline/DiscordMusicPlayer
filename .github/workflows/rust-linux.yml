@@ -60,7 +60,7 @@ jobs:
           strip --strip-all dist/VoicePlay
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: VoicePlay-rust-linux-x86_64
           path: dist/
